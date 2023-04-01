@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+echo "---> Ruby Buildpack"
+
+# 1. GET ARGS
+layersdir=$1
+
+# 2. CREATE THE LAYER DIRECTORY
+rubylayer="$layersdir"/ruby
+mkdir -p "$rubylayer"
+
+# 3. DOWNLOAD RUBY
+echo "---> Downloading and extracting Ruby"
+ruby_url=https://s3-external-1.amazonaws.com/heroku-buildpack-ruby/heroku-18/ruby-3.1.3.tgz
+wget -q -O - "$ruby_url" | tar -xzf - -C "$rubylayer"
+
+# 4. MAKE RUBY AVAILABLE DURING LAUNCH
+echo -e '[types]\nlaunch = true' > "$layersdir/ruby.toml"
+
+# 5. MAKE RUBY AVAILABLE TO THIS SCRIPT
+export PATH="$rubylayer"/bin:$PATH
+export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}"$rubylayer/lib"
+
+# ======= MODIFIED =======
+# 6. INSTALL GEMS
+# Compares previous Gemfile.lock checksum to the current Gemfile.lock
+bundlerlayer="$layersdir/bundler"
+local_bundler_checksum=$((sha256sum Gemfile.lock || echo 'DOES_NOT_EXIST') | cut -d ' ' -f 1)
+remote_bundler_checksum=$(cat "$layersdir/bundler.toml" | yj -t | jq -r .metadata.checksum 2>/dev/null || echo 'DOES_NOT_EXIST')
+# Always set the types table so that we re-use the appropriate layers
+echo -e '[types]\ncache = true\nlaunch = true' >> "$layersdir/bundler.toml"
+
+if [[ -f Gemfile.lock && $local_bundler_checksum == $remote_bundler_checksum ]] ; then
+    # Determine if no gem dependencies have changed, so it can reuse existing gems without running bundle install
+    echo "---> Reusing gems"
+    bundle config --local path "$bundlerlayer" >/dev/null
+    bundle config --local bin "$bundlerlayer/bin" >/dev/null
+else
+    # Determine if there has been a gem dependency change and install new gems to the bundler layer; re-using existing and un-changed gems
+    echo "---> Installing gems"
+    mkdir -p "$bundlerlayer"
+    cat >> "$layersdir/bundler.toml" << EOL
+[metadata]
+checksum = "$local_bundler_checksum"
+EOL
+    bundle config set --local path "$bundlerlayer" && bundle install && bundle binstubs --all --path "$bundlerlayer/bin"
+
+fi
+
+# ========== MODIFIED ===========
+# 7. SET DEFAULT START COMMAND
+cat > "$layersdir/launch.toml" << EOL
+# our web process
+[[processes]]
+type = "web"
+command = "bundle exec ruby app.rb"
+default = true
+
+# our worker process
+[[processes]]
+type = "worker"
+command = "bundle exec ruby worker.rb"
+EOL
+
+
+
+
